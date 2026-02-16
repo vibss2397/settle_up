@@ -1,0 +1,17 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - META_TOKEN=${META_TOKEN}
+      - META_PHONE_ID=${META_PHONE_ID}
+      - META_APP_SECRET=${META_APP_SECRET}
+      - VERIFY_TOKEN=${VERIFY_TOKEN}
+      - SHEET_NAME=${SHEET_NAME}
+      - SPREADSHEET_NAME=${SPREADSHEET_NAME}
+    volumes:
+      # Mount for hot-reload during dev
+      - ./src/llm:/app/src/llm
+      - ./main.py:/app/main.py

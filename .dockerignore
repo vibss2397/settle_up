@@ -1,0 +1,31 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Tests (not needed in production)
+src/tests/
+**/test_*.py
+
+# Dev files
+spec.md
+send_whatsapp_req.py
+*.md
+docker-compose.yml
+
+# IDE
+.vscode/
+.idea/

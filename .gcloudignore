@@ -1,0 +1,17 @@
+# Ignore everything by default
+*
+
+# Include only what's needed for deployment
+!Dockerfile
+!main.py
+!requirements.txt
+!src/
+!src/mapping.json
+!src/llm/
+!src/llm/*.py
+!src/creds/
+!src/creds/*.json
+!src/__init__.py
+
+# Exclude tests
+src/tests/

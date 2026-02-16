@@ -1,0 +1,18 @@
+# Environment & secrets
+.env
+deploy_command.md
+src/mapping.json
+src/creds/service_account.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
