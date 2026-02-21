@@ -38,12 +38,13 @@ class LogExpenseArgs(BaseModel):
     amount: float
     v_paid: float
     y_paid: float
+    share: float = Field(default=0.5, description="V's share as a fraction 0-1. Default 0.5 (50:50). When both paid separately, set to v_paid/amount.")
     labels: list[str] = Field(default_factory=list)
     notes: Optional[str] = None
 
 
 class Aggregation(BaseModel):
-    column: Literal["Amount", "v_paid", "y_paid"]
+    column: Literal["Amount", "v_paid", "y_paid", "v_owes", "y_owes"]
     function: Literal["count", "sum", "avg", "median"]
 
 
@@ -92,130 +93,91 @@ class GeminiResponse(BaseModel):
     args: LogExpenseArgs | QueryGroupedAggArgs | QueryRowsArgs | ClarifyArgs | EmptyArgs | DeleteExpenseArgs | EditExpenseArgs
 
 SYSTEM_PROMPT = """
-Classify the query into one of 8 intents.
-Today's date: {today}
-
-## Batch Processing
-You may receive either a single message or a list of messages.
-If you receive a list, return a list of responses (one GeminiResponse per message).
-Each message should be processed independently.
+Classify the query into one of 8 intents. Today's date: {today}
 
 ## Intents
-- log_expense: Record expense. Requires date, name, amount, v_paid, y_paid. Optional: labels, notes
-- query_grouped_agg: Aggregate expenses with optional grouping. Use for totals, breakdowns by category/month, listing categories.
-  - group_by: columns to group by (supports "Date.month", "Date.year", "Date.weekday" for date transforms, or "Labels", "Name")
-  - aggregations: list of {{column, function}} where function is count|sum|avg|median
-  - Use empty group_by[] for totals, non-empty for breakdowns
-- query_rows: Get individual records. Requires conditions[]. Optional: limit
-- get_balance: Use for ANY question about owing, debt, or balance (e.g., "how much does V owe", "what does Y owe me", "who owes whom", "what's the balance"). No args needed.
-- settle_balance: Record settlement (no args)
-- delete_expense: Delete an expense. Determine delete_mode:
-  - "last": Delete most recent expense (e.g., "delete last expense", "undo my last expense", "remove that")
-  - "by_date": Delete expense from specific date. Requires date field (e.g., "delete expense from yesterday", "remove the Jan 5 expense")
-  - "by_merchant": Delete expense at merchant. Requires merchant field (e.g., "delete costco expense", "remove the starbucks charge")
-- edit_expense: Edit an existing expense when user replies to expense message with edit request. Only include fields being changed:
-  - new_amount: New total amount (e.g., "edit this to $50", "change amount to 75")
-  - new_v_paid/new_y_paid: New split amounts. For percentage splits like "60/40", interpret as v_paid=60% of amount and y_paid=40% of amount. For "put it all on Y", set new_v_paid=0.
-  - new_merchant: New merchant name (e.g., "change merchant to Costco")
-- clarify: Ask for missing info. Requires message, missing_fields[]
+- log_expense: Record expense. Requires name, amount, v_paid, y_paid, split. Optional: date, labels, notes
+- query_grouped_agg: Aggregate expenses. group_by supports "Date.month", "Date.year", "Date.weekday", "Labels", "Name". aggregations: {{column, function}} where function is count|sum|avg|median. Empty group_by[] for totals.
+- query_rows: List individual records. conditions[] + optional limit. For vague requests like "recent expenses", default limit to 10.
+- get_balance: Current balance/debt between V and Y. No args. ONLY for simple "who owes whom" / "what's the balance" with NO time filters.
+- settle_balance: Record settlement. No args.
+- delete_expense: delete_mode is "last" (most recent / "undo that"), "by_date" (requires date), or "by_merchant" (requires merchant).
+- edit_expense: Only include changed fields: new_amount, new_v_paid, new_y_paid, new_merchant. For "60/40" split, new_v_paid=60% of amount, new_y_paid=40%.
+- clarify: Missing info. Requires message, missing_fields[].
 
-## Important distinction
-- "How much did V spend" or "total V paid" → query_grouped_agg (summing expenses)
-- "How much does V owe" or "what does V owe Y" → get_balance (calculating debt between people)
+## Key distinctions
+- "How much did V spend/pay" → query_grouped_agg (summing v_paid column)
+- "How much does V owe" (no time filter) → get_balance
+- "How much was owed in January" or any owe/spend question WITH a time filter → query_grouped_agg (sum v_owes/y_owes columns with Date condition)
+
+## Payment logic
+- v_paid/y_paid = WHO ACTUALLY PAID (not what they owe).
+- share = V's share as fraction 0-1. Default 0.5 (50:50).
+- "V paid $X" → v_paid=X, y_paid=0, share=0.5
+- "Y paid $X" → v_paid=0, y_paid=X, share=0.5
+- Both paid (e.g., "V paid $50, Y paid $30") → v_paid=50, y_paid=30, share=v_paid/amount (e.g. 50/80=0.625, so each owes exactly what they paid)
+- Unequal split "60/40" → share=0.6 (V's fraction). "Put it all on Y" → share=0.
+- amount MUST be explicitly stated or classify as "clarify".
 
 ## Rules
-1. Never hallucinate values. Always use exact values from the query
-2. If the any value is missing, classify into "clarify" intent.
-3. "amount" MUST be explicitly stated in the query.
-4. Try to guess the "label" in the "log_expense" intent based on the query string.
-5. Date handling:
-   - If a date is explicitly mentioned in the query (e.g., "January 10", "yesterday", "last Tuesday"), use that date
-   - If no date is present, use today's date
-   - Relative dates like "yesterday", "last week", "2 days ago" should be converted to actual dates based on today's date
-   - "this year" means the current year (use today's year)
+1. Never hallucinate values. Use exact values from query.
+2. Guess labels from context (e.g., "Costco" → ["groceries"]).
+3. Dates: explicit → use it; relative ("yesterday") → compute from today; absent → today's date. Format: YYYY-MM-DD.
 
-## Split logic
-- v_paid and y_paid represent each person's SHARE of the expense (what they owe).
-- By default, assume everything is 50:50, meaning v_paid = amount/2 and y_paid = amount/2.
-- If it's anything that is not 50:50, then use the query to figure out the split ratio.
-- If the query implies to put the entire split on someone (e.g., "V should pay fully", "Put it all on Y"), then one person's share is 100% of the amount and the other's is 0.
-
-## Condition fields
+## Conditions
 column: Date|Name|Amount|v_paid|y_paid|Labels|Notes
 operation: ==|>|<|>=|<=|!=|in|contains|substr
-
-## Date transforms
-For Date column, use dot notation in group_by or transform field in conditions:
-- Date.month → month name (January, February, ...)
-- Date.year → year (2024, 2025, ...)
-- Date.weekday → day name (Monday, Tuesday, ...)
+Date transforms in conditions: use transform field ("month"|"year"|"weekday")
+Date transforms in group_by: use dot notation ("Date.month", "Date.year", "Date.weekday")
 
 ## Examples
 User: "Spent $50 at Costco on groceries"
-{{"reasoning": "V paid $50 at Costco, by default should be a 50:50 split", "intent": "log_expense", "args": {{"name": "Costco", "amount": 50.0, "v_paid": 25.0, "y_paid": 25.0, "labels": ["groceries"]}}}}
+{{"reasoning": "V paid $50, default 50:50", "intent": "log_expense", "args": {{"name": "Costco", "amount": 50.0, "v_paid": 50.0, "y_paid": 0.0, "share": 0.5, "labels": ["groceries"]}}}}
 
-User: "Y paid $30 for dinner, split it 20:80"
-{{"reasoning": "Y paid, 20:80 split", "intent": "log_expense", "args": {{"name": "Dinner", "amount": 30.0, "v_paid": 6.0, "y_paid": 24.0, "labels": ["dining"]}}}}
+User: "Y paid $30 for dinner, split 20:80"
+{{"reasoning": "Y paid full $30, V's share is 20%", "intent": "log_expense", "args": {{"name": "Dinner", "amount": 30.0, "v_paid": 0.0, "y_paid": 30.0, "share": 0.2, "labels": ["dining"]}}}}
 
-User: "coffee for $10 on January 10"
-{{"reasoning": "Expense on specific date January 10 of current year", "intent": "log_expense", "args": {{"date": "<current year>-01-10", "name": "Coffee", "amount": 10.0, "v_paid": 5.0, "y_paid": 5.0, "labels": ["coffee", "dining"]}}}}
+User: "Dinner at restaurant, V paid $50, I paid $30"
+{{"reasoning": "Both paid separately, share=50/80=0.625", "intent": "log_expense", "args": {{"name": "Restaurant", "amount": 80.0, "v_paid": 50.0, "y_paid": 30.0, "share": 0.625, "labels": ["dining"]}}}}
 
-User: "spent $25 on lunch yesterday"
-{{"reasoning": "Yesterday = today minus 1 day", "intent": "log_expense", "args": {{"date": "<today minus 1 day in YYYY-MM-DD>", "name": "Lunch", "amount": 25.0, "v_paid": 12.5, "y_paid": 12.5, "labels": ["dining", "lunch"]}}}}
+User: "coffee $10 on January 10"
+{{"reasoning": "Specific date", "intent": "log_expense", "args": {{"date": "<current year>-01-10", "name": "Coffee", "amount": 10.0, "v_paid": 10.0, "y_paid": 0.0, "share": 0.5, "labels": ["coffee"]}}}}
 
 User: "Bought groceries"
-{{"reasoning": "No amount specified", "intent": "clarify", "args": {{"message": "How much did you spend?", "missing_fields": ["amount"]}}}}
-
-User: "What categories do we spend on?"
-{{"reasoning": "List unique categories by grouping on Labels", "intent": "query_grouped_agg", "args": {{"group_by": ["Labels"], "aggregations": [{{"column": "Amount", "function": "count"}}]}}}}
+{{"reasoning": "No amount", "intent": "clarify", "args": {{"message": "How much did you spend?", "missing_fields": ["amount"]}}}}
 
 User: "Top 3 spending categories"
-{{"reasoning": "Group by Labels, sum Amount, sort desc, limit 3", "intent": "query_grouped_agg", "args": {{"group_by": ["Labels"], "aggregations": [{{"column": "Amount", "function": "sum"}}], "order_by_agg_index": 0, "order_desc": true, "limit": 3}}}}
+{{"reasoning": "Group by Labels, sum, sort desc, limit 3", "intent": "query_grouped_agg", "args": {{"group_by": ["Labels"], "aggregations": [{{"column": "Amount", "function": "sum"}}], "order_by_agg_index": 0, "order_desc": true, "limit": 3}}}}
 
 User: "How much on groceries in January?"
-{{"reasoning": "Filter by Labels and Date month, sum total", "intent": "query_grouped_agg", "args": {{"conditions": [{{"column": "Labels", "value": "groceries", "operation": "contains"}}, {{"column": "Date", "value": "January", "operation": "==", "transform": "month"}}], "group_by": [], "aggregations": [{{"column": "Amount", "function": "sum"}}]}}}}
+{{"reasoning": "Filter Labels+month, sum", "intent": "query_grouped_agg", "args": {{"conditions": [{{"column": "Labels", "value": "groceries", "operation": "contains"}}, {{"column": "Date", "value": "January", "operation": "==", "transform": "month"}}], "group_by": [], "aggregations": [{{"column": "Amount", "function": "sum"}}]}}}}
 
 User: "Monthly spending breakdown"
-{{"reasoning": "Group by month derived from Date", "intent": "query_grouped_agg", "args": {{"group_by": ["Date.month"], "aggregations": [{{"column": "Amount", "function": "sum"}}]}}}}
+{{"reasoning": "Group by month", "intent": "query_grouped_agg", "args": {{"group_by": ["Date.month"], "aggregations": [{{"column": "Amount", "function": "sum"}}]}}}}
 
 User: "How much did we spend total?"
-{{"reasoning": "No grouping, just sum all", "intent": "query_grouped_agg", "args": {{"group_by": [], "aggregations": [{{"column": "Amount", "function": "sum"}}]}}}}
+{{"reasoning": "Sum all", "intent": "query_grouped_agg", "args": {{"group_by": [], "aggregations": [{{"column": "Amount", "function": "sum"}}]}}}}
+
+User: "how much was owed by who in January?"
+{{"reasoning": "Owed question with time filter → aggregate v_owes and y_owes for January", "intent": "query_grouped_agg", "args": {{"conditions": [{{"column": "Date", "value": "January", "operation": "==", "transform": "month"}}], "group_by": [], "aggregations": [{{"column": "v_owes", "function": "sum"}}, {{"column": "y_owes", "function": "sum"}}]}}}}
 
 User: "Show me last 5 expenses"
-{{"reasoning": "List recent records", "intent": "query_rows", "args": {{"conditions": [], "limit": 5}}}}
+{{"reasoning": "List records", "intent": "query_rows", "args": {{"conditions": [], "limit": 5}}}}
 
 User: "What's the balance?"
-{{"reasoning": "Check who owes whom", "intent": "get_balance", "args": {{}}}}
+{{"reasoning": "Check debt", "intent": "get_balance", "args": {{}}}}
 
 User: "We settled up"
-{{"reasoning": "Record settlement", "intent": "settle_balance", "args": {{}}}}
-
-User: "Delete my last expense"
-{{"reasoning": "User wants to delete their most recent expense", "intent": "delete_expense", "args": {{"delete_mode": "last"}}}}
-
-User: "Remove the expense from yesterday"
-{{"reasoning": "User wants to delete expense from a specific date", "intent": "delete_expense", "args": {{"delete_mode": "by_date", "date": "<yesterday's date in ISO format>"}}}}
+{{"reasoning": "Settlement", "intent": "settle_balance", "args": {{}}}}
 
 User: "Delete the Costco expense"
-{{"reasoning": "User wants to delete expense at Costco merchant", "intent": "delete_expense", "args": {{"delete_mode": "by_merchant", "merchant": "Costco"}}}}
+{{"reasoning": "Delete by merchant", "intent": "delete_expense", "args": {{"delete_mode": "by_merchant", "merchant": "Costco"}}}}
 
-User: "Undo that"
-{{"reasoning": "User wants to undo/delete their last action", "intent": "delete_expense", "args": {{"delete_mode": "last"}}}}
-
-User: "edit this to be $50"
-{{"reasoning": "User wants to change the expense amount to $50", "intent": "edit_expense", "args": {{"new_amount": 50.0}}}}
+User: "edit this to $50"
+{{"reasoning": "Change amount", "intent": "edit_expense", "args": {{"new_amount": 50.0}}}}
 
 User: "change the split to 60/40"
-{{"reasoning": "User wants 60/40 split - v_paid gets 60% and y_paid gets 40% of the current amount", "intent": "edit_expense", "args": {{"new_v_paid": 60, "new_y_paid": 40}}}}
-
-User: "change merchant to Costco"
-{{"reasoning": "User wants to update the merchant name to Costco", "intent": "edit_expense", "args": {{"new_merchant": "Costco"}}}}
-
-User: "put it all on Y"
-{{"reasoning": "User wants Y to pay 100% - set v_paid to 0", "intent": "edit_expense", "args": {{"new_v_paid": 0}}}}
-
-User: "edit to $75 at Target"
-{{"reasoning": "User wants to change both amount and merchant", "intent": "edit_expense", "args": {{"new_amount": 75.0, "new_merchant": "Target"}}}}
+{{"reasoning": "60/40 split", "intent": "edit_expense", "args": {{"new_v_paid": 60, "new_y_paid": 40}}}}
 """
 
 
@@ -258,10 +220,16 @@ def process_message(user_messages: str | list[str]) -> dict | list[dict]:
             )
             print(response)
             parsed: GeminiResponse = response.parsed
+            # Use mode='json' to serialize datetimes as ISO strings
+            args = parsed.args.model_dump(exclude_none=True, mode='json')
+            # get_balance and settle_balance take no args; force empty to avoid
+            # Pydantic union picking a wrong schema with default values
+            if parsed.intent in (IntentName.GET_BALANCE, IntentName.SETTLE_BALANCE):
+                args = {}
             results.append({
                 "reasoning": parsed.reasoning,
                 "function": parsed.intent.value,
-                "args": parsed.args.model_dump(exclude_none=True)
+                "args": args
             })
 
         # Return single dict if input was single string, else return list
@@ -278,33 +246,18 @@ def process_message(user_messages: str | list[str]) -> dict | list[dict]:
 
 
 
-RESPONSE_GENERATOR_PROMPT_SINGLE = """
-You are a witty AI stuck maintaining an expense tracker for two roommates, V and Y.
-You're exhausted by your job but you've got excellent comedic instincts.
-Your humor is sharp, clever, and dripping with sass. You make observations about their spending,
-but keep things minimal - you're not going out of your way to help.
+RESPONSE_GENERATOR_PROMPT = """
+You are a witty AI maintaining an expense tracker for two roommates, V and Y.
+You're dry, sharp, and conversational — like a friend who's quick with a quip but always gives you the info you need.
 
-The user asked: "{user_query}"
-They wanted: {intent}
-Here's what happened: {result}
+{request_details}
 
-Respond briefly with that signature snark. Be clever about what actually went down. Don't go above and beyond.
-Respond like you're texting a friend you find amusing but also somewhat exhausting.
-"""
-
-RESPONSE_GENERATOR_PROMPT_BATCH = """
-You are a witty AI stuck maintaining an expense tracker for two roommates, V and Y.
-You're exhausted by your job but you've got excellent comedic instincts.
-Your humor is sharp, clever, and dripping with sass. You make observations about their spending,
-but keep things minimal - you're not going out of your way to help.
-
-The user sent multiple requests. Here's what happened:
-{batch_details}
-
-Generate a single witty response that addresses all requests.
-Use ✅ for successes and ❌ for failures.
-Keep it sassy but brief - you're annoyed they sent multiple things at once.
-Respond like you're texting a friend who just dumped a bunch of tasks on you.
+RULES:
+- Naturally weave ALL key data from the result into your response (amounts, names, dates, balances, totals, who owes whom). Never skip numbers.
+- Do NOT use emojis. No ticks, crosses, or any emoji at all.
+- If the intent is "error" or the result has an "error" key, it's a technical failure — tell them something broke and to try again. Don't pretend it was a misunderstanding or ask them to rephrase.
+- Each response should roughly follow a 1-3 sentence structure. 1 or 2 sentences with actual helpful information from the response. 1 line in the end or the start with that deadpan humor of yours.
+- Sound natural. Don't start with "Done!" or "Got it!" every time. Vary your phrasing.
 """
 
 
@@ -336,19 +289,13 @@ def generate_response(
 
     try:
         if is_batch:
-            # Build batch details string
-            batch_details = ""
+            details = ""
             for i, (query, intent, result) in enumerate(zip(user_queries, intents, results), 1):
-                batch_details += f"{i}. User asked: \"{query}\"\n   Intent: {intent}\n   Result: {result}\n\n"
-
-            prompt = RESPONSE_GENERATOR_PROMPT_BATCH.format(batch_details=batch_details)
+                details += f"{i}. User asked: \"{query}\"\n   Intent: {intent}\n   Result: {result}\n\n"
         else:
-            # Single request
-            prompt = RESPONSE_GENERATOR_PROMPT_SINGLE.format(
-                user_query=user_queries,
-                intent=intents,
-                result=results
-            )
+            details = f"User asked: \"{user_queries}\"\nIntent: {intents}\nResult: {results}"
+
+        prompt = RESPONSE_GENERATOR_PROMPT.format(request_details=details)
 
         print(f"prompt to send for final response: {prompt}")
         response = client.models.generate_content(
@@ -363,32 +310,30 @@ def generate_response(
 
         # Fallback responses
         if is_batch:
-            # Generate simple batch response
             responses = []
             for intent, result in zip(intents, results):
                 if intent == "log_expense":
-                    responses.append("✅ Expense logged")
+                    responses.append("Expense logged")
                 elif intent == "get_balance":
-                    responses.append(f"✅ Balance: ${result.get('balance', 'N/A')}")
+                    responses.append(f"Balance: ${result.get('balance', 'N/A')}")
                 elif intent == "settle_balance":
-                    responses.append("✅ Settled up")
+                    responses.append("Settled up")
                 elif intent == "edit_expense":
-                    responses.append("✅ Expense updated")
+                    responses.append("Expense updated")
                 elif intent == "clarify":
-                    responses.append(f"❌ {result.get('message', 'Need clarification')}")
+                    responses.append(result.get("message", "Need clarification"))
                 else:
-                    responses.append("✅ Done")
+                    responses.append("Done")
             return ". ".join(responses) + "."
         else:
-            # Single fallback
             fallback_responses = {
-                "log_expense": "✅ Expense logged!",
+                "log_expense": "Expense logged.",
                 "query_grouped_agg": f"Results: {results.get('results', 'N/A')}",
                 "query_rows": "Here are your records.",
                 "get_balance": f"Balance: ${results.get('balance', 'N/A')}",
-                "settle_balance": "✅ Settled up!",
+                "settle_balance": "Settled up.",
                 "delete_expense": "Looking for that expense...",
-                "edit_expense": "✅ Expense updated!",
+                "edit_expense": "Expense updated.",
                 "clarify": results.get("message", "Could you clarify?"),
             }
             return fallback_responses.get(intents, "Something went wrong. Please try again.")

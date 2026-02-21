@@ -133,6 +133,7 @@ def execute_intent(function_name: str, args: dict) -> dict:
             amount=args.get("amount", 0),
             v_paid=args.get("v_paid", 0),
             y_paid=args.get("y_paid", 0),
+            split=args.get("share", 0.5),
             labels=args.get("labels", []),
             notes=args.get("notes"),
             message_id=args.get("_message_id"),
@@ -340,20 +341,23 @@ def whatsapp_webhook(request):
                 updates = {}
                 orig_v = float(original_expense.get("v_paid") or 0)
                 orig_y = float(original_expense.get("y_paid") or 0)
+                orig_v_owes = float(original_expense.get("v_owes") or 0)
                 current_amount = orig_v + orig_y
+
+                # Derive original share (V's fraction of the expense)
+                # from existing owes data. Default 0.5 if we can't determine.
+                share = orig_v_owes / current_amount if current_amount > 0 else 0.5
 
                 # Handle amount change
                 if edit_args.get("new_amount") is not None:
                     new_amount = float(edit_args["new_amount"])
-                    # Update the Amount column
                     updates["Amount"] = new_amount
-                    # Recalculate split proportionally if only amount changes
+                    # Recalculate who paid proportionally
                     if current_amount > 0:
                         v_ratio = orig_v / current_amount
                         updates["v_paid"] = round(new_amount * v_ratio, 2)
                         updates["y_paid"] = round(new_amount * (1 - v_ratio), 2)
                     else:
-                        # Default to 50/50 if no current split
                         updates["v_paid"] = round(new_amount / 2, 2)
                         updates["y_paid"] = round(new_amount / 2, 2)
                     current_amount = new_amount
@@ -366,13 +370,13 @@ def whatsapp_webhook(request):
                     # Check if these look like percentages (values that sum to ~100)
                     if new_v is not None and new_y is not None:
                         if abs((new_v + new_y) - 100) < 1:  # Looks like percentages
+                            share = new_v / 100
                             updates["v_paid"] = round(current_amount * new_v / 100, 2)
                             updates["y_paid"] = round(current_amount * new_y / 100, 2)
                         else:
                             updates["v_paid"] = float(new_v)
                             updates["y_paid"] = float(new_y)
                     elif new_v is not None:
-                        # Only v_paid specified - could be 0 for "put it all on Y"
                         new_v_val = float(new_v)
                         if new_v_val == 0:
                             updates["v_paid"] = 0
@@ -392,6 +396,14 @@ def whatsapp_webhook(request):
                 # Handle merchant change
                 if edit_args.get("new_merchant"):
                     updates["Name"] = edit_args["new_merchant"]
+
+                # Recalculate v_owes/y_owes based on final values
+                if "v_paid" in updates or "y_paid" in updates or "Amount" in updates:
+                    final_v_paid = updates.get("v_paid", orig_v)
+                    final_y_paid = updates.get("y_paid", orig_y)
+                    final_amount = updates.get("Amount", current_amount)
+                    updates["v_owes"] = round(max(0, final_amount * share - final_v_paid), 2)
+                    updates["y_owes"] = round(max(0, final_amount * (1 - share) - final_y_paid), 2)
 
                 if not updates:
                     reply_to_whatsapp(sender, "I couldn't determine what to change. Please be specific, e.g., 'edit to $50' or 'change merchant to Costco'")
@@ -494,22 +506,17 @@ def whatsapp_webhook(request):
 
             # Check for "list all modes" command
             msg_lower = msg_body.lower()
-            if "/list" in msg_lower or "list all modes" in msg_lower or "all modes" in msg_lower:
-                all_modes = [
-                    "log_expense",
-                    "query_grouped_agg",
-                    "query_rows",
-                    "get_balance",
-                    "settle_balance",
-                    "delete_expense",
-                    "edit_expense",
-                    "clarify",
-                ]
-                response_text = generate_response(
-                    user_queries=msg_body,
-                    intents=all_modes,
-                    results=[{"description": "List all available modes"}]
-                )
+            if msg_lower in ('/list', "list"):
+                response_text = "\n".join([
+                    "Here's what I can do:\n",
+                    "Log expense — \"$50 at Costco\"",
+                    "Query totals — \"How much on groceries?\"",
+                    "List expenses — \"Show last 5 expenses\"",
+                    "Check balance — \"Who owes whom?\"",
+                    "Settle up — \"We settled up\"",
+                    "Delete expense — \"Delete the Costco expense\"",
+                    "Edit expense — Reply to a logged expense with \"edit to $50\"",
+                ])
                 reply_to_whatsapp(sender, response_text)
                 return "OK", 200
 

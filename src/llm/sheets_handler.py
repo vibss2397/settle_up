@@ -36,6 +36,7 @@ class SheetsHandler:
         amount: float,
         v_paid: float,
         y_paid: float,
+        split: float,
         notes: Optional[str],
         labels: Optional[list] = [],
         message_id: Optional[str] = None,
@@ -45,12 +46,17 @@ class SheetsHandler:
         Args:
             message_id: The WhatsApp message ID of the user's message (for reply-based delete)
         """
+        assert split >= 0 and split <= 1, "Split must be between 0 and 1"
+        v_owes = max(0, amount * split - v_paid)
+        y_owes = max(0, amount * (1 - split) - y_paid)
         row = [
             date.isoformat(),
             name,
             amount,
             v_paid,
             y_paid,
+            v_owes,
+            y_owes,
             ", ".join(labels),
             notes,
             message_id,
@@ -63,6 +69,8 @@ class SheetsHandler:
             "notes": notes,
             "v_paid": v_paid,
             "y_paid": y_paid,
+            "v_owes": round(v_owes, 2),
+            "y_owes": round(y_owes, 2),
         }
 
     def delete_expense_by_message_id(self, message_id: str) -> dict:
@@ -124,9 +132,11 @@ class SheetsHandler:
                 "Amount": 3,
                 "v_paid": 4,
                 "y_paid": 5,
-                "Labels": 6,
-                "Notes": 7,
-                "message_id": 8,
+                "v_owes": 6,
+                "y_owes": 7,
+                "Labels": 8,
+                "Notes": 9,
+                "message_id": 10,
             }
 
             updated_record = dict(original_record)
@@ -396,12 +406,18 @@ class SheetsHandler:
 
         v_paid = sum(float(r.get("v_paid") or 0) for r in records)
         y_paid = sum(float(r.get("y_paid") or 0) for r in records)
-        diff = abs(v_paid - y_paid)
+        v_owes = sum(float(r.get("v_owes") or 0) for r in records)
+        y_owes = sum(float(r.get("y_owes") or 0) for r in records)
         total = v_paid + y_paid
 
-        if v_paid == y_paid:
+        # v_owes/y_owes now represent what each person still owes
+        # Positive net means Y owes V
+        net = y_owes - v_owes
+        amount_owed = abs(net)
+
+        if net == 0:
             who_owes = None
-        elif v_paid > y_paid:
+        elif net > 0:
             who_owes = "y"
         else:
             who_owes = "v"
@@ -409,8 +425,10 @@ class SheetsHandler:
         return {
             "v_paid_total": v_paid,
             "y_paid_total": y_paid,
+            "v_owes_total": v_owes,
+            "y_owes_total": y_owes,
             "total": total,
-            "amount_owed": diff,
+            "amount_owed": amount_owed,
             "who_owes": who_owes,
         }
 
@@ -432,6 +450,8 @@ class SheetsHandler:
                 amount_owed,
                 amount_owed,
                 0,
+                0,
+                0,
                 "settle-up",
                 "settling up from last batch of payments"
             ]
@@ -445,6 +465,8 @@ class SheetsHandler:
                 amount_owed,
                 0,
                 amount_owed,
+                0,
+                0,
                 "settle-up",
                 "settling up from last batch of payments"
             ]

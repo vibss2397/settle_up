@@ -36,6 +36,7 @@ class TestLogExpense:
             amount=50.0,
             v_paid=25.0,
             y_paid=25.0,
+            split=0.5,
             notes=None,
             labels=[],
         )
@@ -44,34 +45,62 @@ class TestLogExpense:
         assert result["amount"] == 50.0
         assert result["v_paid"] == 25.0
         assert result["y_paid"] == 25.0
+        assert result["v_owes"] == 25.0
+        assert result["y_owes"] == 25.0
 
-    def test_log_expense_with_labels(self, handler):
-        """Verify labels are included in return."""
+    def test_log_expense_v_pays_all_split_equal(self, handler):
+        """V pays full amount, split 50/50."""
         result = handler.log_expense(
             date=datetime.now(),
             name="Grocery Store",
             amount=75.0,
-            v_paid=37.5,
-            y_paid=37.5,
+            v_paid=75.0,
+            y_paid=0,
+            split=0.5,
             notes=None,
             labels=["groceries", "food"],
         )
 
         assert result["labels"] == ["groceries", "food"]
+        assert result["v_paid"] == 75.0
+        assert result["y_paid"] == 0
+        assert result["v_owes"] == 37.5
+        assert result["y_owes"] == 37.5
 
-    def test_log_expense_with_notes(self, handler):
-        """Verify notes field is included."""
+    def test_log_expense_y_pays_all_unequal_split(self, handler):
+        """Y pays full amount, unequal split (V=30%, Y=70%)."""
         result = handler.log_expense(
             date=datetime.now(),
             name="Restaurant",
             amount=60.0,
-            v_paid=30.0,
-            y_paid=30.0,
+            v_paid=0,
+            y_paid=60.0,
+            split=0.3,
             notes="Birthday dinner",
             labels=["dining"],
         )
 
         assert result["notes"] == "Birthday dinner"
+        assert result["v_paid"] == 0
+        assert result["y_paid"] == 60.0
+        assert result["v_owes"] == 18.0
+        assert result["y_owes"] == 42.0
+
+    def test_log_expense_both_pay_no_one_owes(self, handler):
+        """Both pay exactly what they owe, no balance created."""
+        result = handler.log_expense(
+            date=datetime.now(),
+            name="Shared Cab",
+            amount=40.0,
+            v_paid=15.0,
+            y_paid=25.0,
+            split=0.375,
+            notes="Airport ride",
+            labels=["transport"],
+        )
+
+        assert result["v_paid"] == result["v_owes"]
+        assert result["y_paid"] == result["y_owes"]
 
     def test_expense_appears_in_query(self, handler):
         """Log expense and verify it appears in query results."""
@@ -80,8 +109,9 @@ class TestLogExpense:
             date=datetime.now(),
             name=unique_name,
             amount=99.99,
-            v_paid=50.0,
-            y_paid=49.99,
+            v_paid=99.99,
+            y_paid=0,
+            split=0.3,
             notes=None,
             labels=["test"],
         )
@@ -253,6 +283,8 @@ class TestGetBalance:
 
         assert "v_paid_total" in result
         assert "y_paid_total" in result
+        assert "v_owes_total" in result
+        assert "y_owes_total" in result
         assert "total" in result
         assert "amount_owed" in result
         assert "who_owes" in result
@@ -267,19 +299,21 @@ class TestGetBalance:
         assert isinstance(result["amount_owed"], (int, float))
 
     def test_balance_math_is_correct(self, handler):
-        """Verify total equals v + y and amount_owed is the diff."""
+        """Verify total equals v + y and amount_owed is the net diff."""
         result = handler.get_balance()
 
         assert abs(result["total"] - (result["v_paid_total"] + result["y_paid_total"])) < 0.01
-        assert abs(result["amount_owed"] - abs(result["v_paid_total"] - result["y_paid_total"])) < 0.01
+        v_net = result["v_paid_total"] - result["v_owes_total"]
+        assert abs(result["amount_owed"] - abs(v_net)) < 0.01
 
     def test_who_owes_logic(self, handler):
-        """Verify who_owes is correct based on paid totals."""
+        """Verify who_owes is correct based on net (paid - owes)."""
         result = handler.get_balance()
 
-        if result["v_paid_total"] == result["y_paid_total"]:
+        v_net = result["v_paid_total"] - result["v_owes_total"]
+        if v_net == 0:
             assert result["who_owes"] is None
-        elif result["v_paid_total"] > result["y_paid_total"]:
+        elif v_net > 0:
             assert result["who_owes"] == "y"
         else:
             assert result["who_owes"] == "v"
@@ -306,13 +340,14 @@ class TestConditionFiltering:
 
     def test_equals_operation(self, handler):
         """Test == operator."""
-        # First log an expense with known values
+        # V pays all, unequal split (60/40)
         handler.log_expense(
             date=datetime.now(),
             name="EqualsTest",
             amount=100.0,
-            v_paid=50.0,
-            y_paid=50.0,
+            v_paid=100.0,
+            y_paid=0,
+            split=0.6,
             notes=None,
             labels=[],
         )
@@ -331,12 +366,14 @@ class TestConditionFiltering:
 
     def test_contains_operation_case_insensitive(self, handler):
         """Test contains operator is case-insensitive."""
+        # Y pays all, split 50/50
         handler.log_expense(
             date=datetime.now(),
             name="ContainsTest",
             amount=25.0,
-            v_paid=12.5,
-            y_paid=12.5,
+            v_paid=0,
+            y_paid=25.0,
+            split=0.5,
             notes=None,
             labels=["UPPERCASE"],
         )
@@ -427,12 +464,14 @@ class TestResponseStructure:
 
     def test_log_expense_returns_dict(self, handler):
         """log_expense should return a dict."""
+        # Both pay unequally, each pays exactly their share
         result = handler.log_expense(
             date=datetime.now(),
             name="StructureTest",
             amount=10.0,
-            v_paid=5.0,
-            y_paid=5.0,
+            v_paid=7.0,
+            y_paid=3.0,
+            split=0.7,
             notes=None,
             labels=[],
         )
